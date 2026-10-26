@@ -46,6 +46,50 @@ busy_returns_error_tuple_instead_of_crashing_test_() ->
         end
     end}.
 
+%% A COMMIT refused busy (a reader on another connection still holds its
+%% shared lock) must not leave the transaction open: the connection would
+%% go back to the pool holding the write lock, and every writer after it
+%% would fail busy.
+failed_commit_rolls_back_test_() ->
+    {timeout, 10, fun() ->
+        Path = tmp_db_path(),
+        Name = kura_driver_sqlite_commit_test_pool,
+        {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 2}),
+        try
+            {ok, ConnA, TokenA} = kura_pool_sqlite:checkout(Name, #{}),
+            {ok, ConnB, TokenB} = kura_pool_sqlite:checkout(Name, #{}),
+            ok = esqlite3:exec(ConnA, ~"PRAGMA busy_timeout = 50"),
+            ok = esqlite3:exec(ConnB, ~"PRAGMA busy_timeout = 50"),
+            ok = esqlite3:exec(ConnA, ~"CREATE TABLE t (id INTEGER)"),
+            ok = kura_pool_sqlite:checkin(Name, TokenB),
+            %% A reads inside a transaction: its shared lock stays until it ends.
+            ok = esqlite3:exec(ConnA, ~"BEGIN"),
+            [] = esqlite3:q(ConnA, ~"SELECT id FROM t"),
+            Result = kura_driver_sqlite:transaction(
+                kura_pool_sqlite,
+                Name,
+                fun() ->
+                    kura_driver_sqlite:query(
+                        kura_pool_sqlite, Name, ~"INSERT INTO t VALUES (1)", [], #{}
+                    )
+                end,
+                #{}
+            ),
+            ?assertMatch({error, _}, Result),
+            ok = esqlite3:exec(ConnA, ~"COMMIT"),
+            %% B is out of its transaction: it can start another, and A can
+            %% write (no lock left behind).
+            ok = esqlite3:exec(ConnB, ~"BEGIN"),
+            ok = esqlite3:exec(ConnB, ~"ROLLBACK"),
+            ok = esqlite3:exec(ConnA, ~"INSERT INTO t VALUES (2)"),
+            ?assertEqual([[2]], esqlite3:q(ConnA, ~"SELECT id FROM t")),
+            kura_pool_sqlite:checkin(Name, TokenA)
+        after
+            kura_pool_sqlite:stop_pool(Name),
+            file:delete(Path)
+        end
+    end}.
+
 tmp_db_path() ->
     Rand = integer_to_list(erlang:unique_integer([positive])),
     iolist_to_binary(["/tmp/kura_sqlite_busy_test_", Rand, ".db"]).

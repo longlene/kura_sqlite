@@ -90,8 +90,17 @@ begin_run_finish(Conn, Fun) ->
             try Fun() of
                 Result ->
                     case esqlite3:exec(Conn, ~"COMMIT") of
-                        ok -> Result;
-                        {error, _} = E -> E
+                        ok ->
+                            Result;
+                        {error, _} = E ->
+                            %% A COMMIT that fails (SQLITE_BUSY: a reader
+                            %% still holds its lock past the busy_timeout)
+                            %% leaves the transaction open. Rolled back
+                            %% here, or the connection goes back to the
+                            %% pool holding the write lock, and every
+                            %% writer after it fails busy for good.
+                            _ = esqlite3:exec(Conn, ~"ROLLBACK"),
+                            E
                     end
             catch
                 Class:Reason:Stack ->

@@ -190,8 +190,10 @@ reclaim_dead_lease(Name) ->
             case ets:select_replace(Name, MatchSpec) of
                 1 ->
                     %% It may have died mid-transaction.
-                    try esqlite3:exec(Conn, <<"ROLLBACK">>) of _ -> ok
-                    catch _:_ -> ok
+                    try esqlite3:exec(Conn, <<"ROLLBACK">>) of
+                        _ -> ok
+                    catch
+                        _:_ -> ok
                     end,
                     {ok, Conn, {Name, Conn}};
                 0 ->
@@ -219,7 +221,8 @@ give_away({Name, Conn}, NewOwner, _GiftData) when is_pid(NewOwner) ->
     %% The new holder is recorded, so the lease isn't taken for one whose
     %% holder died once the old one exits (see reclaim_dead_lease/1).
     case ets:whereis(Name) of
-        undefined -> ok;
+        undefined ->
+            ok;
         _Tid ->
             _ = ets:update_element(Name, Conn, {2, {busy, NewOwner}}),
             ok

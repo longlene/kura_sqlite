@@ -139,12 +139,18 @@ reclaims_a_lease_whose_holder_died_test() ->
             ok = esqlite3:exec(Conn, ~"BEGIN"),
             ok = esqlite3:exec(Conn, ~"INSERT INTO t VALUES (1)"),
             Parent ! leased,
-            receive never -> ok end
+            receive
+                never -> ok
+            end
         end),
-        receive leased -> ok end,
+        receive
+            leased -> ok
+        end,
         ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
         exit(Holder, kill),
-        receive {'DOWN', Ref, process, Holder, _} -> ok end,
+        receive
+            {'DOWN', Ref, process, Holder, _} -> ok
+        end,
         %% Taken over, its transaction rolled back.
         {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{timeout => 0}),
         ?assertEqual([[0]], esqlite3:q(Conn, ~"SELECT count(*) FROM t")),
@@ -161,7 +167,11 @@ a_live_holder_keeps_its_lease_test() ->
         {ok, _Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
         %% Handed to another process that's alive: still not reclaimable,
         %% even after the original holder (this test) would have gone.
-        Other = spawn(fun() -> receive stop -> ok end end),
+        Other = spawn(fun() ->
+            receive
+                stop -> ok
+            end
+        end),
         ok = kura_pool_sqlite:give_away(Token, Other, undefined),
         ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
         Other ! stop
