@@ -3,7 +3,7 @@
 
 -behaviour(supervisor).
 
--export([start/3, stop/1]).
+-export([start/3, start/4, stop/1]).
 -export([init/1]).
 
 -doc """
@@ -14,10 +14,14 @@ returns an error rather than killing the caller.
 """.
 -spec start(atom(), binary() | string(), non_neg_integer()) -> {ok, pid()} | {error, term()}.
 start(Name, DbPath, Size) ->
+    start(Name, DbPath, Size, #{}).
+
+-spec start(atom(), binary() | string(), non_neg_integer(), map()) -> {ok, pid()} | {error, term()}.
+start(Name, DbPath, Size, Opts) ->
     Caller = self(),
     {Starter, Monitor} = spawn_monitor(fun() ->
         process_flag(trap_exit, true),
-        Caller ! {self(), started(supervisor:start_link(?MODULE, {Name, DbPath, Size}))}
+        Caller ! {self(), started(supervisor:start_link(?MODULE, {Name, DbPath, Size, Opts}))}
     end),
     receive
         {Starter, Result} ->
@@ -46,12 +50,12 @@ stop(Supervisor) ->
         exit:noproc -> ok
     end.
 
--spec init({atom(), binary() | string(), non_neg_integer()}) ->
+-spec init({atom(), binary() | string(), non_neg_integer(), map()}) ->
     {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
-init({Name, DbPath, Size}) ->
+init({Name, DbPath, Size, Opts}) ->
     Pool = #{
         id => pool,
-        start => {kura_pool_sqlite, start_link, [Name, DbPath, Size, self()]},
+        start => {kura_pool_sqlite, start_link, [Name, DbPath, Size, self(), Opts]},
         restart => permanent,
         shutdown => 5000
     },

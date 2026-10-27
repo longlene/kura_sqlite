@@ -42,6 +42,143 @@ drains_pool_then_returns_no_conns_test() ->
         kura_pool_sqlite:stop_pool(Name)
     end.
 
+queued_checkout_gets_the_returned_connection_test() ->
+    Name = pool_for_queue,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => ~":memory:", pool_size => 1, queue => true
+    }),
+    try
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        Self = self(),
+        Waiter = spawn_link(fun() ->
+            Self ! {waited, kura_pool_sqlite:checkout(Name, #{timeout => 2000})}
+        end),
+        receive
+            {waited, Early} -> error({did_not_wait, Early})
+        after 100 -> ok
+        end,
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        receive
+            {waited, Reply} -> ?assertMatch({ok, Conn, _}, Reply)
+        after 2000 -> error(not_served)
+        end,
+        unlink(Waiter)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+queued_checkouts_are_served_in_order_test() ->
+    Name = pool_for_queue_order,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => ~":memory:", pool_size => 1, queue => true
+    }),
+    try
+        {ok, _, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        Self = self(),
+        Waiters = [
+            begin
+                Pid = spawn(fun() ->
+                    {ok, _, T} = kura_pool_sqlite:checkout(Name, #{timeout => 2000}),
+                    Self ! {served, N},
+                    ok = kura_pool_sqlite:checkin(Name, T)
+                end),
+                timer:sleep(20),
+                Pid
+            end
+         || N <- [1, 2, 3]
+        ],
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        Order = [
+            receive
+                {served, N} -> N
+            after 2000 -> error(not_served)
+            end
+         || _ <- Waiters
+        ],
+        ?assertEqual([1, 2, 3], Order)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+queued_checkout_times_out_and_leaves_the_pool_working_test() ->
+    Name = pool_for_queue_timeout,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => ~":memory:", pool_size => 1, queue => true
+    }),
+    try
+        {ok, _, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ?assertEqual({error, checkout_timeout}, kura_pool_sqlite:checkout(Name, #{timeout => 100})),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, _, _}, kura_pool_sqlite:checkout(Name, #{timeout => 500}))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+on_open_runs_on_every_connection_test() ->
+    Name = pool_for_on_open,
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    OnOpen = fun(Conn) -> esqlite3:exec(Conn, ~"PRAGMA busy_timeout = 12345") end,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => Path, pool_size => 2, on_open => OnOpen
+    }),
+    try
+        {ok, C1, T1} = kura_pool_sqlite:checkout(Name, #{}),
+        {ok, C2, T2} = kura_pool_sqlite:checkout(Name, #{}),
+        ?assertEqual([[12345]], esqlite3:q(C1, ~"PRAGMA busy_timeout")),
+        ?assertEqual([[12345]], esqlite3:q(C2, ~"PRAGMA busy_timeout")),
+        ok = kura_pool_sqlite:checkin(Name, T1),
+        ok = kura_pool_sqlite:checkin(Name, T2),
+        %% DDL marks the lease; its connection is compared with a new one,
+        %% which on_open has run on too, so it is kept.
+        #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
+        ?assertMatch(#{rows := [#{timeout := 12345}]}, sql(Name, ~"PRAGMA busy_timeout")),
+        %% A lease that changes it gets a fresh connection, set up again.
+        #{} = sql(Name, ~"PRAGMA busy_timeout = 1"),
+        {ok, C3, T3} = kura_pool_sqlite:checkout(Name, #{}),
+        {ok, C4, T4} = kura_pool_sqlite:checkout(Name, #{}),
+        ?assertEqual([[12345]], esqlite3:q(C3, ~"PRAGMA busy_timeout")),
+        ?assertEqual([[12345]], esqlite3:q(C4, ~"PRAGMA busy_timeout")),
+        ok = kura_pool_sqlite:checkin(Name, T3),
+        ok = kura_pool_sqlite:checkin(Name, T4)
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
+    end.
+
+on_open_as_mfa_test() ->
+    Name = pool_for_on_open_mfa,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => ~":memory:",
+        pool_size => 1,
+        on_open => {esqlite3, exec, [~"PRAGMA recursive_triggers = ON"]}
+    }),
+    try
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ?assertEqual([[1]], esqlite3:q(Conn, ~"PRAGMA recursive_triggers")),
+        ok = kura_pool_sqlite:checkin(Name, Token)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+failing_on_open_fails_the_start_test() ->
+    ?assertMatch(
+        {error, {on_open, _}},
+        kura_pool_sqlite:start_pool(pool_for_bad_on_open, #{
+            database => ~":memory:",
+            pool_size => 1,
+            on_open => fun(_) -> {error, nope} end
+        })
+    ),
+    ?assertMatch(
+        {error, {on_open, {error, boom}}},
+        kura_pool_sqlite:start_pool(pool_for_raising_on_open, #{
+            database => ~":memory:",
+            pool_size => 1,
+            on_open => fun(_) -> error(boom) end
+        })
+    ).
+
 stop_pool_idempotent_test() ->
     Name = pool_for_stop,
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => <<":memory:">>, pool_size => 1}),

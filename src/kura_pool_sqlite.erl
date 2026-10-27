@@ -69,17 +69,31 @@ after the reset. Closing it needs a process that owns each connection and
 runs every statement on it, or support from esqlite.
 
 `checkout/2` takes `#{timeout => Ms}`, 5000 by default, as the timeout of
-its call to the pool. It does not wait for a connection to come free:
-with none free it returns `{error, no_conns}` at once. A checkout that
-times out gives its lease back, so a connection the pool hands out after
-the caller stopped waiting is not lost to it.
+its call to the pool. By default it does not wait for a connection to come
+free: with none free it returns `{error, no_conns}` at once. A pool
+started with `queue => true` instead queues the checkout, first come first
+served, until a connection is returned or the timeout passes, which then
+returns `{error, checkout_timeout}`. A checkout that times out gives its
+lease back, so a connection the pool hands out after the caller stopped
+waiting is not lost to it.
+
+## Opening a connection
+
+`on_open`, a `fun((esqlite3:esqlite3()) -> ok | {error, Reason})` or an
+`{M, F, A}` called as `M:F(Conn, A...)`, runs on every connection the
+pool opens: at start, when one is replaced, and the one a dirty lease is
+compared with. Settings, `PRAGMA`s and extensions a consumer needs on
+every connection go here; set on a leased connection directly, they are
+lost when the pool replaces it. A connection whose `on_open` fails or
+raises is closed and counts as one that could not be opened.
 
 A restarted pool opens new connections. Connections leased before the
 restart are no longer the pool's: their checkins are ignored, and they
 are closed when garbage collected. A stopping pool closes only the
 connections nobody holds.
 
-`pool_size` from `start_pool/2` opts pre-opens N connections.
+`pool_size` from `start_pool/2` opts pre-opens N connections. `queue` and
+`on_open` are described above.
 
 ## Example
 
@@ -104,7 +118,7 @@ connections nobody holds.
     capabilities/0
 ]).
 
--export([start_link/4, dirty/2]).
+-export([start_link/4, start_link/5, dirty/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 
@@ -130,12 +144,20 @@ connections nobody holds.
 
 -type outcome() :: kept | {kept, [term()]} | dropped.
 
--type baseline() :: #{settings := [term()], db_path := binary() | string()}.
+-type baseline() :: #{settings := [term()], db_path := binary() | string(), on_open := on_open()}.
+
+-type on_open() ::
+    undefined | fun((esqlite3:esqlite3()) -> term()) | {module(), atom(), [term()]}.
+
+-type waiter() :: {gen_server:from(), pid(), reference()}.
 
 -type state() :: #{
     name := atom(),
     supervisor := pid(),
     db_path := binary() | string(),
+    on_open := on_open(),
+    queue := boolean(),
+    waiting := queue:queue(waiter()),
     size := non_neg_integer(),
     short := boolean(),
     baseline := baseline(),
@@ -159,7 +181,7 @@ connections nobody holds.
 start_pool(Name, Opts) ->
     DbPath = maps:get(database, Opts, ~":memory:"),
     Size = maps:get(pool_size, Opts, 1),
-    kura_pool_sqlite_sup:start(Name, DbPath, Size).
+    kura_pool_sqlite_sup:start(Name, DbPath, Size, maps:with([queue, on_open], Opts)).
 
 -spec stop_pool(kura_pool:name()) -> ok.
 stop_pool(Name) ->
@@ -236,21 +258,31 @@ dirty(Name, Conn) ->
 -doc false.
 -spec start_link(atom(), binary() | string(), non_neg_integer(), pid()) -> gen_server:start_ret().
 start_link(Name, DbPath, Size, Supervisor) ->
-    gen_server:start_link({local, Name}, ?MODULE, {Name, DbPath, Size, Supervisor}, []).
+    start_link(Name, DbPath, Size, Supervisor, #{}).
 
--spec init({atom(), binary() | string(), non_neg_integer(), pid()}) ->
+-doc false.
+-spec start_link(atom(), binary() | string(), non_neg_integer(), pid(), map()) ->
+    gen_server:start_ret().
+start_link(Name, DbPath, Size, Supervisor, Opts) ->
+    gen_server:start_link({local, Name}, ?MODULE, {Name, DbPath, Size, Supervisor, Opts}, []).
+
+-spec init({atom(), binary() | string(), non_neg_integer(), pid(), map()}) ->
     {ok, state()} | {stop, term()}.
-init({Name, DbPath, Size, Supervisor}) ->
+init({Name, DbPath, Size, Supervisor, Opts}) ->
     process_flag(trap_exit, true),
-    case open_n(DbPath, Size, []) of
+    OnOpen = maps:get(on_open, Opts, undefined),
+    case open_n(DbPath, OnOpen, Size, []) of
         {ok, Conns} ->
             {ok, #{
                 name => Name,
                 supervisor => Supervisor,
                 db_path => DbPath,
+                on_open => OnOpen,
+                queue => maps:get(queue, Opts, false) =:= true,
+                waiting => queue:new(),
                 size => Size,
                 short => false,
-                baseline => baseline(Conns, DbPath),
+                baseline => baseline(Conns, DbPath, OnOpen),
                 available => Conns,
                 out => #{},
                 resetting => #{}
@@ -261,18 +293,13 @@ init({Name, DbPath, Size, Supervisor}) ->
 
 -spec handle_call(request(), gen_server:from(), state()) ->
     {reply, term(), state()} | {noreply, state()}.
-handle_call({checkout, Borrower, Lease}, _From, State0) ->
+handle_call({checkout, Borrower, Lease}, From, State0) ->
     case replenished(State0) of
-        State = #{name := Name, available := [Conn | Rest], out := Out} ->
-            Monitor = erlang:monitor(process, Borrower),
-            {reply, {ok, Conn, {Name, Conn, Lease}}, State#{
-                available := Rest,
-                out := Out#{
-                    Conn => #{
-                        lease => Lease, monitor => Monitor, dirty => false, given_away => false
-                    }
-                }
-            }};
+        State = #{available := [_ | _], waiting := Waiting} ->
+            %% Those already waiting go first.
+            {noreply, served(State#{waiting := queue:in({From, Borrower, Lease}, Waiting)})};
+        State = #{queue := true, waiting := Waiting} ->
+            {noreply, State#{waiting := queue:in({From, Borrower, Lease}, Waiting)}};
         State ->
             {reply, {error, no_conns}, State}
     end;
@@ -303,10 +330,12 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
 -spec handle_cast(term(), state()) -> {noreply, state()}.
-handle_cast({abandon, Lease}, State = #{out := Out}) ->
+handle_cast({abandon, Lease}, State = #{out := Out, waiting := Waiting}) ->
     case [{Conn, Held} || Conn := Held = #{lease := L} <- Out, L =:= Lease] of
-        [{Conn, Held}] -> {noreply, returned(Conn, Held, none, State)};
-        [] -> {noreply, State}
+        [{Conn, Held}] ->
+            {noreply, returned(Conn, Held, none, State)};
+        [] ->
+            {noreply, State#{waiting := queue:filter(fun({_, _, L}) -> L =/= Lease end, Waiting)}}
     end;
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -403,13 +432,39 @@ learned(Settings, State = #{baseline := Baseline}) ->
 -spec restored(esqlite3:esqlite3(), gen_server:from() | none, kept | dropped, state()) -> state().
 restored(Conn, From, kept, State = #{available := Available}) ->
     ok = replied(From),
-    State#{available := [Conn | Available]};
+    served(State#{available := [Conn | Available]});
 %% esqlite's close is not safe against a statement another process is still
 %% running on the connection, and gives up without closing when its rollback
 %% fails, so a dropped connection is left to its destructor.
 restored(_Conn, From, dropped, State) ->
     ok = replied(From),
-    opened(State).
+    served(opened(State)).
+
+%% Free connections go to those waiting, in the order they asked.
+-spec served(state()) -> state().
+served(
+    State = #{
+        name := Name, available := [Conn | Rest], out := Out, waiting := Waiting0
+    }
+) ->
+    case queue:out(Waiting0) of
+        {{value, {From, Borrower, Lease}}, Waiting} ->
+            Monitor = erlang:monitor(process, Borrower),
+            gen_server:reply(From, {ok, Conn, {Name, Conn, Lease}}),
+            served(State#{
+                available := Rest,
+                waiting := Waiting,
+                out := Out#{
+                    Conn => #{
+                        lease => Lease, monitor => Monitor, dirty => false, given_away => false
+                    }
+                }
+            });
+        {empty, _} ->
+            State
+    end;
+served(State) ->
+    State.
 
 %% A connection that could not be replaced is opened on a later checkout.
 -spec replenished(state()) -> state().
@@ -421,8 +476,12 @@ replenished(State) ->
     State.
 
 -spec opened(state()) -> state().
-opened(State = #{name := Name, db_path := DbPath, available := Available, short := Short}) ->
-    case esqlite3:open(to_filename(DbPath)) of
+opened(
+    State = #{
+        name := Name, db_path := DbPath, on_open := OnOpen, available := Available, short := Short
+    }
+) ->
+    case open(DbPath, OnOpen) of
         {ok, Fresh} ->
             State#{available := [Fresh | Available], short := false};
         {error, _} when Short ->
@@ -500,7 +559,7 @@ inspected(Conn, Baseline) ->
     end.
 
 -spec unchanged(esqlite3:esqlite3(), baseline()) -> boolean() | {new, [term()]}.
-unchanged(Conn, #{settings := Opened, db_path := DbPath}) ->
+unchanged(Conn, #{settings := Opened, db_path := DbPath, on_open := OnOpen}) ->
     Temp = esqlite3:q(Conn, ~"SELECT count(*) FROM temp.sqlite_schema"),
     Attached = esqlite3:q(
         Conn, ~"SELECT count(*) FROM pragma_database_list WHERE name NOT IN ('main', 'temp')"
@@ -508,7 +567,7 @@ unchanged(Conn, #{settings := Opened, db_path := DbPath}) ->
     case {Temp, Attached} =:= {[[0]], [[0]]} andalso settings(Conn) of
         false -> false;
         Opened -> true;
-        Settings -> Settings =:= settings_of_new(DbPath) andalso {new, Settings}
+        Settings -> Settings =:= settings_of_new(DbPath, OnOpen) andalso {new, Settings}
     end.
 
 %% WAL is kept in the database file, and a connection opened on a WAL
@@ -516,9 +575,9 @@ unchanged(Conn, #{settings := Opened, db_path := DbPath}) ->
 %% switched the journal mode changed what a new connection has. Settings
 %% that differ from the baseline are held against a connection opened now,
 %% and become the baseline if they match it.
--spec settings_of_new(binary() | string()) -> [term()] | {error, term()}.
-settings_of_new(DbPath) ->
-    case esqlite3:open(to_filename(DbPath)) of
+-spec settings_of_new(binary() | string(), on_open()) -> [term()] | {error, term()}.
+settings_of_new(DbPath, OnOpen) ->
+    case open(DbPath, OnOpen) of
         {ok, New} ->
             Settings = settings(New),
             closed = closed(New),
@@ -527,13 +586,14 @@ settings_of_new(DbPath) ->
             {error, Reason}
     end.
 
--spec baseline([esqlite3:esqlite3()], binary() | string()) -> baseline().
-baseline([Conn | _], DbPath) ->
+-spec baseline([esqlite3:esqlite3()], binary() | string(), on_open()) -> baseline().
+baseline([Conn | _], DbPath, OnOpen) ->
     case apart(fun() -> settings(Conn) end) of
-        Settings when is_list(Settings) -> #{settings => Settings, db_path => DbPath}
+        Settings when is_list(Settings) ->
+            #{settings => Settings, db_path => DbPath, on_open => OnOpen}
     end;
-baseline([], DbPath) ->
-    #{settings => [], db_path => DbPath}.
+baseline([], DbPath, OnOpen) ->
+    #{settings => [], db_path => DbPath, on_open => OnOpen}.
 
 -spec settings(esqlite3:esqlite3()) -> [term()].
 settings(Conn) ->
@@ -570,17 +630,49 @@ request_name(Status = #{message := Message}) when is_tuple(Message), tuple_size(
 request_name(Status) ->
     Status.
 
--spec open_n(binary() | string(), non_neg_integer(), [esqlite3:esqlite3()]) ->
+-spec open_n(binary() | string(), on_open(), non_neg_integer(), [esqlite3:esqlite3()]) ->
     {ok, [esqlite3:esqlite3()]} | {error, term()}.
-open_n(_DbPath, 0, Acc) ->
+open_n(_DbPath, _OnOpen, 0, Acc) ->
     {ok, Acc};
-open_n(DbPath, N, Acc) when N > 0 ->
-    case esqlite3:open(to_filename(DbPath)) of
+open_n(DbPath, OnOpen, N, Acc) when N > 0 ->
+    case open(DbPath, OnOpen) of
         {ok, Conn} ->
-            open_n(DbPath, N - 1, [Conn | Acc]);
+            open_n(DbPath, OnOpen, N - 1, [Conn | Acc]);
         {error, _} = Err ->
             close_each(Acc),
             Err
+    end.
+
+%% A connection, with what the consumer runs on every one.
+-spec open(binary() | string(), on_open()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
+open(DbPath, OnOpen) ->
+    case esqlite3:open(to_filename(DbPath)) of
+        {ok, Conn} when OnOpen =:= undefined ->
+            {ok, Conn};
+        {ok, Conn} ->
+            case run_on_open(OnOpen, Conn) of
+                ok ->
+                    {ok, Conn};
+                {error, Why} ->
+                    closed = closed(Conn),
+                    {error, {on_open, Why}}
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec run_on_open(on_open(), esqlite3:esqlite3()) -> ok | {error, term()}.
+run_on_open(OnOpen, Conn) ->
+    try
+        case OnOpen of
+            Fun when is_function(Fun, 1) -> Fun(Conn);
+            {M, F, A} -> apply(M, F, [Conn | A])
+        end
+    of
+        {error, _} = Error -> Error;
+        _ -> ok
+    catch
+        Class:Reason -> {error, {Class, Reason}}
     end.
 
 -spec to_filename(binary() | string()) -> string().
